@@ -1,6 +1,6 @@
 # TD backup files
 Backup/
-haxlib.*.toe
+dtd-del.*.toe
 
 # AppStore / config
 .env
