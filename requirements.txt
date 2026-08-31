@@ -1,0 +1,37 @@
+numpy==2.1.2
+# 1.26.0 is the newest release still built against CUDA 12.8 / cuDNN 9.x (same stack as
+# nvidia-cudnn-cu12/tensorrt below) -- see onnxruntime.ai's CUDA EP requirements table:
+# 1.21.x-1.26.x all target CUDA 12.8, cuDNN 9.x. Starting at 1.27, PyPI's onnxruntime-gpu
+# switches its DEFAULT build to CUDA 13, which would also require swapping every
+# nvidia-*-cu12 wheel below for a cu13 equivalent and a matching NVIDIA driver -- a bigger,
+# separate jump, not done here.
+onnxruntime-gpu[cuda,cudnn]==1.26.0
+nvidia-cudnn-cu12==9.11.0.98
+# opencv-python-headless (not full opencv-python): TD itself never needs highgui/imshow, and
+# the standalone webcam script uses tkinter+PIL for its preview window instead -- see
+# python/standalone/webcam_yolo_pose.py's TkPreviewWindow docstring.
+# opencv-python-headless
+pyautogui
+python-escpos
+pywinusb
+qrcode[pil]
+
+# 10.9 was originally pinned because onnxruntime-gpu's own TensorRT execution provider
+# requires exactly that version (1.21-1.26 -- see https://onnxruntime.ai/docs/execution-
+# providers/TensorRT-ExecutionProvider.html#requirements). That EP crashes TD's own
+# process outright (confirmed live -- see docs/learnings/onnx-runtime.md), so this
+# project instead uses the raw `tensorrt` + `cuda-python` packages directly (no
+# onnxruntime involved at all for TensorRT) -- see python/util/trt_inference_manager.py.
+# That path is NOT onnxruntime-version-locked; 10.9 is kept only because it's already
+# proven working (an .engine cache already exists for it), not because it's mandatory.
+# Only the CUDA EP's own DLLs (cudnn/cublas/etc.) ship via the nvidia-*-cu12 wheels above --
+# TensorRT itself is a separate NVIDIA package, hosted on NVIDIA's own pip index, not PyPI.
+--extra-index-url https://pypi.nvidia.com
+tensorrt==10.9.0.34
+# cuda-python: 12.x series matches our CUDA 12.x stack; 13.x changed the API entirely
+# Dependency: pywin32 (auto-installed) needs post-install: `python .venv/Scripts/pywin32_postinstall.py -install`
+# TD usage requires manual sys.path (TD doesn't process .pth files): see trt_poc_test.py module init
+cuda-python==12.6.0
+
+# Working project (touchdesigner-onnx): nvidia_cudnn_cu12 9.11.0.98
+# This project (haxlib): nvidia_cudnn_cu12 9.24.0.43

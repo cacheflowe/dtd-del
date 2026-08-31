@@ -1,0 +1,22 @@
+{
+  "name": "haxlib-www",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview",
+    "oversite": "cd node_modules/oversite && npm run dev",
+    "all": "concurrently \"npm run oversite\" \"npm run dev\"",
+    "update-libs": "npx npm-check-updates -u && npm install"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "concurrently": "^10.0.3",
+    "vite": "^8.1.5"
+  },
+  "dependencies": {
+    "oversite": "^1.0.9"
+  }
+}

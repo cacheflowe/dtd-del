@@ -1,0 +1,7 @@
+app_w	2244	number
+app_h	1204	number
+dashboard_url	http://localhost:3003/api/dashboard	string
+app_id	dtd-del	string
+app_title	DTD Del	string
+audio_volume	1	number
+brightness	1	number

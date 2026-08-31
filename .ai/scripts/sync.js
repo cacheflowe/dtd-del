@@ -1,0 +1,740 @@
+#!/usr/bin/env node
+/**
+ * Cross-Platform AI Workspace Sync Engine
+ *
+ * Links (or copies) canonical sources in .ai/ to the locations
+ * consumed by Claude Code, VS Code Copilot, Codex, and Antigravity CLI.
+ *
+ * Antigravity CLI shares Codex's `.agents/` layout (skills at
+ * `.agents/skills/<name>/SKILL.md`, MCP at `.agents/mcp_config.json`), so it
+ * inherits everything we already write for Codex — no separate target paths.
+ *
+ * Run: node .ai/scripts/sync.js
+ * Watch: node .ai/scripts/sync.js --watch
+ * Zero external dependencies. Works identically on macOS and Windows.
+ */
+
+let fs;
+let path;
+let crypto;
+let ROOT;
+let MANIFEST_PATH;
+let WATCH_MODE;
+
+/**
+ * Load Node built-ins in a way that works in both CommonJS and ESM projects.
+ * Also derives repo root from argv[1] so we don't rely on __dirname/import.meta.
+ */
+async function initRuntime() {
+  fs = await import("node:fs");
+  path = await import("node:path");
+  crypto = await import("node:crypto");
+
+  const scriptPath = path.resolve(process.argv[1] || ".");
+  const scriptDir = path.dirname(scriptPath);
+
+  // Always operate from the repo root (script lives at .ai/scripts/sync.js)
+  ROOT = path.resolve(scriptDir, "../..");
+  process.chdir(ROOT);
+
+  MANIFEST_PATH = path.join(scriptDir, "..", ".sync-manifest.json");
+  WATCH_MODE = process.argv.includes("--watch");
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const dirsToCreate = [
+  ".claude/skills",
+  ".claude/commands", // deprecated — kept for backwards-compat with older Claude Code setups
+  ".github/prompts",
+  ".github/skills",
+  ".agents/skills",
+  ".agents/context",
+  ".codex",
+  ".pi",
+];
+
+// Single source -> single destination (MCP linking is handled separately via syncMcpTargets)
+const fileLinks = [];
+
+// Multiple sources concatenated -> every harness (project-specific first, base second).
+// A generated skills + prompts index section is injected between the two sources.
+const compositeLinks = {
+  sources: [".ai/AGENTS.md", ".ai/_base.md"],
+  dests: ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md", ".agents/context/AGENTS.md"],
+};
+
+// Skills: flat .ai/skills/<name>.md -> <target>/<name>/SKILL.md
+// .claude/skills and .agents/skills also receive prompts (both use skills as the primary mechanism)
+const skillTargets = [".claude/skills", ".github/skills", ".agents/skills"];
+
+// Prompts: .ai/prompts/<name>.md -> .claude/skills/<name>/SKILL.md (Claude Code)
+//          and .github/prompts/<name>.prompt.md (GitHub Copilot)
+// Note: .claude/commands/ is deprecated — prompts now live in .claude/skills/
+const githubPromptTarget = { root: ".github/prompts", suffix: ".prompt.md" };
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function sha256(filePath) {
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+function loadManifest() {
+  try {
+    return JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+let manifest = {};
+
+/**
+ * Link src -> dest. Symlink where permitted; verbatim copy fallback otherwise.
+ *
+ * Every destination handled here is a gitignored, sync-generated derivative of an
+ * .ai source (skills and prompts). These are never hand-edited — you edit the
+ * source instead — so we always regenerate them. We deliberately do NOT keep the
+ * old manifest-hash "local override" guard: because the manifest is gitignored, a
+ * lost or drifted manifest entry made genuine copies get misclassified as
+ * hand-edits and frozen, silently serving stale skills/prompts (see syncSkillFile
+ * for the same class of bug). A skill/prompt whose *name* has no .ai source is
+ * never visited here, so genuine user-authored extras are still left untouched.
+ *
+ * Guardrails:
+ *  - Existing symlinks and generated copies are replaced with a fresh symlink.
+ *  - Without symlink permission, we copy the source verbatim — no header is
+ *    injected, since a prepended comment would corrupt skill/prompt frontmatter
+ *    that must start at byte 0.
+ */
+function syncAsset(src, dest) {
+  const stats = fs.lstatSync(dest, { throwIfNoEntry: false });
+  const alreadyCurrent = stats && !stats.isSymbolicLink() && fs.readFileSync(dest).equals(fs.readFileSync(src));
+
+  try {
+    const relTarget = path.relative(path.dirname(path.resolve(dest)), path.resolve(src));
+    if (stats) fs.unlinkSync(dest); // replace whatever is there (symlink or generated copy)
+    fs.symlinkSync(relTarget, path.resolve(dest), "file");
+    delete manifest[dest];
+    console.log(`  \x1b[32m✓\x1b[0m Linked: ${dest} -> ${src}`);
+  } catch (err) {
+    if (err.code === "EPERM" || err.code === "EACCES" || err.code === "EINVAL") {
+      // Copy fallback (e.g. Windows without symlink permission). Copy verbatim.
+      fs.copyFileSync(src, dest);
+      manifest[dest] = sha256(dest);
+      console.log(
+        alreadyCurrent
+          ? `  \x1b[90m–\x1b[0m Unchanged: ${dest}`
+          : `  \x1b[32m→\x1b[0m Copied (no symlink permission): ${dest}`,
+      );
+    } else {
+      console.error(`  \x1b[31m✕\x1b[0m Error linking ${dest}:`, err.message);
+    }
+  }
+}
+
+/**
+ * Copy a markdown source into a generated SKILL.md without prepending any
+ * header. Skill frontmatter must remain at the start of the file for scanners.
+ *
+ * Generated skill copies are pure derivatives of .ai/skills — the single source
+ * of truth. They are never hand-edited (edit the source instead) and live in
+ * gitignored, sync-owned directories, so we always regenerate them.
+ *
+ * This deliberately does NOT use the manifest-hash "local override" guard. That
+ * guard froze any copy whose hash was missing from (or drifted out of) the
+ * manifest — e.g. after a fresh clone, `git clean`, or a manifest reset — because
+ * the manifest is gitignored while the copies are not committed either. A frozen
+ * copy was silently misclassified as a hand-edit and served stale skills to
+ * Codex/Antigravity indefinitely. Always overwriting self-heals those copies and
+ * keeps every harness identical.
+ */
+function syncSkillFile(src, dest) {
+  const stats = fs.lstatSync(dest, { throwIfNoEntry: false });
+  if (stats?.isSymbolicLink()) {
+    fs.unlinkSync(dest);
+  } else if (stats && fs.readFileSync(dest).equals(fs.readFileSync(src))) {
+    // Already identical to the source — skip the rewrite to keep watch mode quiet.
+    manifest[dest] = sha256(dest);
+    console.log(`  \x1b[90m–\x1b[0m Unchanged: ${dest}`);
+    return;
+  }
+
+  fs.copyFileSync(src, dest);
+  manifest[dest] = sha256(dest);
+  console.log(`  \x1b[32m→\x1b[0m Copied skill: ${dest}`);
+}
+
+/**
+ * Remove symlinks in a directory that we no longer generate.
+ */
+function cleanStaleLinks(dir, expectedFiles) {
+  if (!fs.existsSync(dir)) return;
+  const expected = new Set(expectedFiles);
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isSymbolicLink() && !expected.has(entry.name)) {
+      fs.unlinkSync(full);
+      console.log(`  \x1b[90m✗\x1b[0m Removed stale: ${full}`);
+    } else if (!entry.isSymbolicLink() && !entry.isDirectory() && !expected.has(entry.name)) {
+      // Stale generated copy — only remove if we originally wrote it
+      if (manifest[full] && manifest[full] === sha256(full)) {
+        fs.unlinkSync(full);
+        delete manifest[full];
+        console.log(`  \x1b[90m✗\x1b[0m Removed stale copy: ${full}`);
+      }
+    } else if (entry.isDirectory()) {
+      // For skill folders: check if the SKILL.md inside is stale
+      const skillFile = path.join(full, "SKILL.md");
+      const skillStats = fs.lstatSync(skillFile, { throwIfNoEntry: false });
+      if (!expected.has(entry.name)) {
+        if (skillStats?.isSymbolicLink()) {
+          fs.unlinkSync(skillFile);
+          fs.rmSync(full, { recursive: true });
+          console.log(`  \x1b[90m✗\x1b[0m Removed stale: ${full}/`);
+        } else if (skillStats && manifest[skillFile] && manifest[skillFile] === sha256(skillFile)) {
+          fs.unlinkSync(skillFile);
+          delete manifest[skillFile];
+          fs.rmSync(full, { recursive: true });
+          console.log(`  \x1b[90m✗\x1b[0m Removed stale copy: ${full}/`);
+        }
+      }
+    }
+  }
+}
+
+const AI_SYNC_MARKER = "<!-- ai-sync-generated -->";
+
+/**
+ * Concatenate multiple source files (with an optional generated section
+ * injected after the first source) and write to each destination.
+ * Ownership is detected via an embedded marker comment at the end of each
+ * generated file — no external manifest needed.
+ * Guardrails:
+ *  - Existing symlinks are always replaced (always ours).
+ *  - Files containing the marker are our generated copies → refreshed.
+ *  - Any other physical file is a human-made local override → preserved.
+ */
+function writeComposite(sources, dests, injectedSection) {
+  const parts = sources
+    .filter((src) => {
+      if (!fs.existsSync(src)) {
+        console.log(`  \x1b[33m!\x1b[0m Source missing: ${src} — skipping.`);
+        return false;
+      }
+      return true;
+    })
+    .map((src) => fs.readFileSync(src, "utf8").trimEnd());
+
+  if (parts.length === 0) return;
+
+  if (injectedSection) {
+    parts.splice(1, 0, injectedSection.trimEnd());
+  }
+
+  const content = parts.join("\n\n") + "\n\n" + AI_SYNC_MARKER + "\n";
+
+  dests.forEach((dest) => {
+    const stats = fs.lstatSync(dest, { throwIfNoEntry: false });
+    if (stats) {
+      if (stats.isSymbolicLink()) {
+        fs.unlinkSync(dest);
+      } else {
+        const existing = fs.readFileSync(dest, "utf8");
+        if (existing === content) {
+          console.log(`  \x1b[90m–\x1b[0m Unchanged: ${dest}`);
+          return;
+        }
+        if (!existing.includes(AI_SYNC_MARKER)) {
+          console.log(`  \x1b[33m!\x1b[0m Local override at ${dest} — preserving.`);
+          return;
+        }
+      }
+    }
+    fs.writeFileSync(dest, content, "utf8");
+    console.log(`  \x1b[32m→\x1b[0m Composed: ${dest}`);
+  });
+}
+
+const TOML_SYNC_MARKER = "# ai-sync-generated";
+
+/**
+ * Convert .ai/mcp-servers.json (MCP JSON format) to a Codex config.toml with
+ * [mcp_servers.*] tables. Ownership is detected via a marker comment at the top.
+ * Guardrails: if the file exists without our marker, it's a user-owned config — preserved.
+ */
+function writeCodexConfig(src, dest) {
+  if (!fs.existsSync(src)) {
+    console.log(`  \x1b[33m!\x1b[0m Source missing: ${src} — skipping.`);
+    return;
+  }
+
+  let content;
+  try {
+    const raw = JSON.parse(fs.readFileSync(src, "utf8"));
+    const servers = raw.mcpServers || raw.mcp_servers || {};
+    const lines = [TOML_SYNC_MARKER, ""];
+    for (const [name, cfg] of Object.entries(servers)) {
+      lines.push(`[mcp_servers.${name}]`);
+      if (cfg.command) lines.push(`command = ${tomlStr(cfg.command)}`);
+      if (cfg.args?.length) lines.push(`args = [${cfg.args.map(tomlStr).join(", ")}]`);
+      if (cfg.env && Object.keys(cfg.env).length) {
+        const pairs = Object.entries(cfg.env)
+          .map(([k, v]) => `${k} = ${tomlStr(v)}`)
+          .join(", ");
+        lines.push(`env = { ${pairs} }`);
+      }
+      lines.push("");
+    }
+    content = lines.join("\n");
+  } catch (err) {
+    console.error(`  \x1b[31m✕\x1b[0m Failed to convert ${src} to TOML:`, err.message);
+    return;
+  }
+
+  const stats = fs.lstatSync(dest, { throwIfNoEntry: false });
+  if (stats) {
+    if (stats.isSymbolicLink()) {
+      fs.unlinkSync(dest);
+    } else {
+      const existing = fs.readFileSync(dest, "utf8");
+      if (existing === content) {
+        console.log(`  \x1b[90m–\x1b[0m Unchanged: ${dest}`);
+        return;
+      }
+      if (!existing.startsWith(TOML_SYNC_MARKER)) {
+        console.log(`  \x1b[33m!\x1b[0m Local override at ${dest} — preserving.`);
+        return;
+      }
+    }
+  }
+  fs.writeFileSync(dest, content, "utf8");
+  console.log(`  \x1b[32m→\x1b[0m Generated: ${dest}`);
+}
+
+function tomlStr(s) {
+  return JSON.stringify(String(s));
+}
+
+function readSkillDescription(skillPath) {
+  const raw = fs.readFileSync(skillPath, "utf8");
+  const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fm) return "No description provided.";
+  const line = fm[1].split(/\r?\n/).find((l) => l.trim().toLowerCase().startsWith("description:"));
+  if (!line) return "No description provided.";
+  return line.replace(/^\s*description\s*:\s*/i, "").trim() || "No description provided.";
+}
+
+/**
+ * Description for a project doc: frontmatter `description` if present,
+ * otherwise the first `# ` heading (docs rarely carry frontmatter).
+ */
+function readDocDescription(docPath) {
+  const raw = fs.readFileSync(docPath, "utf8");
+  const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (fm) {
+    const line = fm[1].split(/\r?\n/).find((l) => l.trim().toLowerCase().startsWith("description:"));
+    const desc = line && line.replace(/^\s*description\s*:\s*/i, "").trim();
+    if (desc) return desc;
+  }
+  const h1 = raw.match(/^#\s+(.+)$/m);
+  return h1 ? h1[1].trim() : "No description provided.";
+}
+
+/**
+ * Recursively list markdown files under the project's docs/ folder
+ * (root-relative, forward-slash paths). Returns [] if docs/ doesn't exist.
+ */
+function listDocSources(root = "docs") {
+  if (!fs.existsSync(root)) return [];
+  const results = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && entry.name.endsWith(".md")) results.push(full.replace(/\\/g, "/"));
+    }
+  };
+  walk(root);
+  return results;
+}
+
+/**
+ * List configured MCP servers from .ai/mcp-servers.json as index entries.
+ * Informational only — harnesses load MCP from their own generated configs.
+ * Uses an optional `description` key, falling back to the launch command or URL.
+ */
+function listMcpServers(srcPath = ".ai/mcp-servers.json") {
+  if (!fs.existsSync(srcPath)) return [];
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(srcPath, "utf8"));
+  } catch {
+    return [];
+  }
+  return Object.entries(config.mcpServers || {}).map(([name, def]) => {
+    const detail =
+      def.description ||
+      (def.command ? `\`${[def.command, ...(def.args || [])].join(" ")}\`` : null) ||
+      def.serverUrl ||
+      def.url ||
+      def.httpUrl ||
+      "No description provided.";
+    return `- **${name}** — ${detail}`;
+  });
+}
+
+/**
+ * Build the generated skills + prompts + docs + MCP index section that gets
+ * injected between .ai/AGENTS.md and .ai/_base.md at compose time. Source files
+ * are never mutated — the index exists only in the generated outputs.
+ */
+function buildIndexSection(skillSources, promptSources, docSources) {
+  const sorted = (lines) => lines.sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }));
+  const entries = (dir, items, emptyMsg) => {
+    if (!items.length) return [`- ${emptyMsg}`];
+    return sorted(
+      items.map((item) => {
+        const p = `${dir}/${item.name}`;
+        return `- [${p}](${p}) — ${readSkillDescription(p)}`;
+      }),
+    );
+  };
+  const docEntries = docSources.length
+    ? sorted(docSources.map((p) => `- [${p}](${p}) — ${readDocDescription(p)}`))
+    : ["- No docs found in `docs/`."];
+  const mcpEntries = listMcpServers();
+
+  return [
+    "## Skills, Prompts & Docs Index (auto-generated)",
+    "",
+    "### Skills",
+    "",
+    ...entries(".ai/skills", skillSources, "No skills found in `.ai/skills/`."),
+    "",
+    "### Prompts (slash commands)",
+    "",
+    ...entries(".ai/prompts", promptSources, "No prompts found in `.ai/prompts/`."),
+    "",
+    "### Project Docs",
+    "",
+    ...docEntries,
+    "",
+    "### MCP Servers",
+    "",
+    ...(mcpEntries.length
+      ? sorted(mcpEntries)
+      : ["- No MCP servers configured in [.ai/mcp-servers.json](.ai/mcp-servers.json)."]),
+  ].join("\n");
+}
+
+/**
+ * Convert .ai/mcp-servers.json into Antigravity CLI's workspace MCP profile at
+ * .agents/mcp_config.json. Antigravity uses the standard `{ "mcpServers": ... }`
+ * shape but renames remote-server URL fields:
+ *   legacy `url` or `httpUrl` → modern `serverUrl`.
+ * Ownership is detected by an `_ai_sync_generated` top-level key so a
+ * hand-edited file (without the key) is preserved untouched.
+ */
+function writeAntigravityMCP(src, dest) {
+  if (!fs.existsSync(src)) {
+    console.log(`  \x1b[33m!\x1b[0m Source missing: ${src} — skipping.`);
+    return;
+  }
+
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(src, "utf8"));
+  } catch (err) {
+    console.error(`  \x1b[31m✕\x1b[0m Failed to parse ${src}:`, err.message);
+    return;
+  }
+
+  const servers = raw.mcpServers || raw.mcp_servers || {};
+  const converted = {};
+  for (const [name, cfg] of Object.entries(servers)) {
+    const next = { ...cfg };
+    if (next.url || next.httpUrl) {
+      next.serverUrl = next.serverUrl || next.url || next.httpUrl;
+      delete next.url;
+      delete next.httpUrl;
+    }
+    converted[name] = next;
+  }
+
+  const payload = { _ai_sync_generated: true, mcpServers: converted };
+  const content = JSON.stringify(payload, null, 2) + "\n";
+
+  const existing = fs.existsSync(dest) ? fs.readFileSync(dest, "utf8") : null;
+  if (existing === content) {
+    console.log(`  \x1b[90m–\x1b[0m Unchanged: ${dest}`);
+    return;
+  }
+  if (existing !== null) {
+    try {
+      const existingParsed = JSON.parse(existing);
+      if (!existingParsed._ai_sync_generated) {
+        console.log(`  \x1b[33m!\x1b[0m Local override at ${dest} — preserving.`);
+        return;
+      }
+    } catch {
+      console.log(`  \x1b[33m!\x1b[0m Unparseable JSON at ${dest} — preserving.`);
+      return;
+    }
+  }
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.writeFileSync(dest, content, "utf8");
+  console.log(`  \x1b[32m→\x1b[0m Generated: ${dest}`);
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+/**
+ * Sync `.ai/mcp-servers.json` to all MCP destinations:
+ *   - .mcp.json (symlink — Claude Code + Copilot)
+ *   - .pi/mcp.json (symlink — .pi agent harness)
+ *   - .codex/config.toml (generated TOML — Codex)
+ *   - .agents/mcp_config.json (generated JSON — Antigravity CLI)
+ *
+ * When the source is missing or has zero servers, this is a no-op for new
+ * setups, and a *cleanup* for setups that previously had servers: any
+ * generated targets that are still ours (marker / flag / symlink) are
+ * removed so the repo doesn't carry empty stubs.
+ */
+function syncMcpTargets(src) {
+  const codexDest = ".codex/config.toml";
+  const antigravityDest = ".agents/mcp_config.json";
+  const claudeDest = ".mcp.json";
+  const piDest = ".pi/mcp.json";
+
+  let servers = {};
+  let sourceExists = fs.existsSync(src);
+  if (sourceExists) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(src, "utf8"));
+      servers = raw.mcpServers || raw.mcp_servers || {};
+    } catch (err) {
+      console.error(`  \x1b[31m✕\x1b[0m Failed to parse ${src}:`, err.message);
+      return;
+    }
+  }
+
+  if (!sourceExists || Object.keys(servers).length === 0) {
+    const reason = sourceExists ? "no servers defined" : "source missing";
+    console.log(`  \x1b[90m–\x1b[0m MCP sync skipped (${reason}).`);
+    removeGeneratedMcpTarget(codexDest, "toml");
+    removeGeneratedMcpTarget(antigravityDest, "json");
+    removeGeneratedMcpTarget(claudeDest, "symlink", src);
+    removeGeneratedMcpTarget(piDest, "symlink", src);
+    return;
+  }
+
+  syncAsset(src, claudeDest);
+  syncAsset(src, piDest);
+  writeCodexConfig(src, codexDest);
+  writeAntigravityMCP(src, antigravityDest);
+}
+
+/**
+ * Remove a previously-generated MCP target if we still own it. Ownership
+ * checks per format:
+ *   - toml: first line is `# ai-sync-generated`
+ *   - json: top-level `_ai_sync_generated: true` flag
+ *   - symlink: lstat reports a symlink whose target matches `src`
+ * Anything else is a user-owned file and is preserved untouched.
+ */
+function removeGeneratedMcpTarget(dest, kind, src) {
+  const stats = fs.lstatSync(dest, { throwIfNoEntry: false });
+  if (!stats) return;
+  let owned = false;
+  if (kind === "symlink") {
+    if (stats.isSymbolicLink()) {
+      try {
+        const linkTarget = fs.readlinkSync(dest);
+        const resolved = path.resolve(path.dirname(dest), linkTarget);
+        owned = resolved === path.resolve(src);
+      } catch {
+        owned = false;
+      }
+    }
+  } else if (stats.isFile()) {
+    const existing = fs.readFileSync(dest, "utf8");
+    if (kind === "toml") {
+      owned = existing.startsWith(TOML_SYNC_MARKER);
+    } else if (kind === "json") {
+      try {
+        owned = !!JSON.parse(existing)._ai_sync_generated;
+      } catch {
+        owned = false;
+      }
+    }
+  }
+  if (owned) {
+    fs.unlinkSync(dest);
+    console.log(`  \x1b[33m✕\x1b[0m Removed empty MCP target: ${dest}`);
+  } else {
+    console.log(`  \x1b[33m!\x1b[0m Local override at ${dest} — preserving.`);
+  }
+}
+
+function runSync() {
+  console.log("\x1b[34m=== Syncing Cross-Platform AI Workspace ===\x1b[0m\n");
+
+  const skillSources = fs.existsSync(".ai/skills")
+    ? fs.readdirSync(".ai/skills", { withFileTypes: true }).filter((item) => item.isFile() && item.name.endsWith(".md"))
+    : [];
+
+  const promptSources = fs.existsSync(".ai/prompts")
+    ? fs
+        .readdirSync(".ai/prompts", { withFileTypes: true })
+        .filter((item) => item.isFile() && item.name.endsWith(".md"))
+    : [];
+
+  console.log("\x1b[34m[1/5] Ensuring directories exist...\x1b[0m");
+  dirsToCreate.forEach((dir) => {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      console.log(`  ✓ Created: ${dir}`);
+    }
+  });
+
+  console.log("\x1b[34m\n[2/5] Generating root + harness linkages...\x1b[0m");
+  fileLinks.forEach((link) => {
+    if (fs.existsSync(link.src)) {
+      syncAsset(link.src, link.dest);
+    } else {
+      console.log(`  \x1b[33m!\x1b[0m Source missing: ${link.src} — skipping.`);
+    }
+  });
+  syncMcpTargets(".ai/mcp-servers.json");
+  writeComposite(
+    compositeLinks.sources,
+    compositeLinks.dests,
+    buildIndexSection(skillSources, promptSources, listDocSources()),
+  );
+
+  console.log("\x1b[34m\n[3/5] Compiling skills + prompts for Claude Code + Codex + Copilot...\x1b[0m");
+  const skillNames = skillSources.map((item) => path.basename(item.name, ".md"));
+  const promptNames = promptSources.map((item) => path.basename(item.name, ".md"));
+
+  // Warn about name collisions between skills and prompts
+  const collisions = skillNames.filter((n) => promptNames.includes(n));
+  if (collisions.length) {
+    console.warn(
+      `  \x1b[33m!\x1b[0m Name collision between skills and prompts: ${collisions.join(", ")} — skill takes precedence.`,
+    );
+  }
+
+  // Targets that receive both skills and prompts (agents treat them as the same concept)
+  const fullSkillTargets = new Set([".claude/skills", ".agents/skills"]);
+
+  skillTargets.forEach((targetRoot) => {
+    const expectedNames = fullSkillTargets.has(targetRoot) ? [...new Set([...skillNames, ...promptNames])] : skillNames;
+    cleanStaleLinks(targetRoot, expectedNames);
+    skillSources.forEach((item) => {
+      const skillName = path.basename(item.name, ".md");
+      const src = path.join(".ai/skills", item.name);
+      const skillDir = path.join(targetRoot, skillName);
+      fs.mkdirSync(skillDir, { recursive: true });
+      const dest = path.join(skillDir, "SKILL.md");
+      targetRoot === ".agents/skills" ? syncSkillFile(src, dest) : syncAsset(src, dest);
+    });
+    // Prompts also land in full-skill targets as SKILL.md
+    if (fullSkillTargets.has(targetRoot)) {
+      promptSources.forEach((item) => {
+        const promptName = path.basename(item.name, ".md");
+        if (collisions.includes(promptName)) return; // skill takes precedence
+        const src = path.join(".ai/prompts", item.name);
+        const skillDir = path.join(targetRoot, promptName);
+        fs.mkdirSync(skillDir, { recursive: true });
+        const dest = path.join(skillDir, "SKILL.md");
+        targetRoot === ".agents/skills" ? syncSkillFile(src, dest) : syncAsset(src, dest);
+      });
+    }
+  });
+
+  // Also write prompts to .claude/commands/ for backwards-compat with older Claude Code setups (deprecated)
+  const expectedCommandNames = promptSources.map((item) => path.basename(item.name, ".md") + ".md");
+  cleanStaleLinks(".claude/commands", expectedCommandNames);
+  promptSources.forEach((item) => {
+    const promptName = path.basename(item.name, ".md");
+    const src = path.join(".ai/prompts", item.name);
+    syncAsset(src, path.join(".claude/commands", promptName + ".md"));
+  });
+
+  console.log("\x1b[34m\n[4/5] Compiling GitHub Copilot prompts...\x1b[0m");
+  const expectedGithubNames = promptSources.map((item) => path.basename(item.name, ".md") + githubPromptTarget.suffix);
+  cleanStaleLinks(githubPromptTarget.root, expectedGithubNames);
+  promptSources.forEach((item) => {
+    const promptName = path.basename(item.name, ".md");
+    const src = path.join(".ai/prompts", item.name);
+    syncAsset(src, path.join(githubPromptTarget.root, promptName + githubPromptTarget.suffix));
+  });
+
+  console.log("\x1b[34m\n[5/5] Saving manifest...\x1b[0m");
+  const newManifestJson = JSON.stringify(manifest, null, 2);
+  const existingManifestJson = (() => {
+    try {
+      return fs.readFileSync(MANIFEST_PATH, "utf8");
+    } catch {
+      return null;
+    }
+  })();
+  if (newManifestJson !== existingManifestJson) {
+    fs.writeFileSync(MANIFEST_PATH, newManifestJson);
+    console.log("  ✓ Manifest updated.");
+  } else {
+    console.log("  – Manifest unchanged.");
+  }
+  console.log("\x1b[32m\n=== Workspace Synchronized ===\x1b[0m");
+}
+
+// ---------------------------------------------------------------------------
+// Watch Mode
+// ---------------------------------------------------------------------------
+
+function startWatch() {
+  const DEBOUNCE_MS = 300;
+  let timeout = null;
+
+  const debouncedSync = () => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => {
+      console.log(`\n\x1b[90m[${new Date().toLocaleTimeString()}] Change detected in .ai/ — re-syncing...\x1b[0m\n`);
+      runSync();
+    }, DEBOUNCE_MS);
+  };
+
+  // Watch .ai/ recursively (supported on macOS and Windows)
+  fs.watch(path.join(ROOT, ".ai"), { recursive: true }, (eventType, filename) => {
+    // Ignore manifest and hidden files
+    if (!filename || filename.startsWith(".sync-manifest") || filename.startsWith(".")) return;
+    debouncedSync();
+  });
+
+  console.log("\x1b[36m\n👁  Watching .ai/ for changes (Ctrl+C to stop)...\x1b[0m\n");
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  await initRuntime();
+  manifest = loadManifest();
+  runSync();
+  if (WATCH_MODE) {
+    startWatch();
+  }
+}
+
+main().catch((err) => {
+  console.error("\x1b[31m✕\x1b[0m Sync failed:", err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+});
