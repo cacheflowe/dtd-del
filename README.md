@@ -1,14 +1,31 @@
-## TD app concepts for street interactive
+## DTD DEL interactive
 
-- TD onnx - YOLO 26 for Moke's new app
-- Copy MGM TD components into haxlib project
-- New GitHub repo for Moke project
+DTD DEL is an interactive camera-powered installation in downtown Denver. 
+
+## TODOs
+
+#### General app:
+
+- [ ] Add python extension to CameraFX tox
+- [ ] Save individual viz as external saved tox files
+- [ ] Cycle through visuals on a timer - every 15 mins
+  - [ ] Try to shut down inactive viz (via extension?)
+
+#### Fix in Yolo
+
+- [ ] z-index of debug boxes in any viz - attach z to y coord, w/low muiltiplier
+- [ ] Warmup still fails sometimes? How do we ensure that ONNX model initializes
+
+#### Ambient interactive concepts:
+
+- [ ] pops plexus
+- [ ] move captured rects next to each other
+- [ ] time particles w/past texture of people
+- [ ] particles launching off people - stars, sparkles, happy things
+- [x] Motion particles
+- [x] segmentation of just people, but bounding boxes would be fine
+- [x] labels that say nice things about people
+
+#### Other, later
+
 - Update kittredge project with latest haxlib techniques
-- Yunet debug view - collapse x1/x2/x_top/x_bottom in Yunet and also Yolo26
-- Concepts:
-  - Motion particles
-  - move captured rects next to each other
-  - time particles w/past texture of people
-  - segmentation of just people, but bounding boxes would be fine
-  - particles launching off people - stars, sparkles, happy things
-  - labels that say nice things about people
