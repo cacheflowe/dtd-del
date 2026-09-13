@@ -6,7 +6,7 @@ DTD DEL is an interactive camera-powered installation in downtown Denver.
 
 #### Install:
 
-- [ ] Get Rustdesk installed on machine
+- [x] Get Rustdesk installed on machine
 - [ ] Get TD license and load on machine
 
 #### General app:
