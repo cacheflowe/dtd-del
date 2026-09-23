@@ -176,13 +176,15 @@ class App:
 	# ===============================================
 
 	def AddStoreListeners(self):
+		print("[App] Adding AppStore listeners...", self.AppStore)
 		# self.AppStore.AddListener(self)
-		# self.AppStore.AddListener(self, App.PERFORM_TOGGLE)
+		self.AppStore.AddListener(self, App.PERFORM_TOGGLE)
 		return
 
 	# def OnAppStoreValueChanged(self, key, value, type):
 	# 	print(f"[App] *** {key} = {value} (type: {type})")
 	# 	return
 
-	# def On_perform_toggle(self, key, value, type):
-	# 	ui.performMode = value
+	def On_perform_toggle(self, key, value, type):
+		ui.performMode = value
+		print(f"[App] On_perform_toggle: {key} = {value} (type: {type})")
